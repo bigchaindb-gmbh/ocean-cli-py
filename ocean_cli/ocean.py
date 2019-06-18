@@ -1,23 +1,16 @@
 import click
 import json
 import logging
-import os
 import re
 import time
 
 from squid_py import ConfigProvider
 from squid_py.accounts.account import Account
-from squid_py.agreements.service_agreement import ServiceAgreement
-from squid_py.agreements.service_factory import ServiceTypes
 from squid_py.config import Config
-from squid_py.did import did_to_id_bytes, id_to_did
-from squid_py.keeper import Keeper, Token, DIDRegistry
-from squid_py.keeper.agreements.agreement_manager import AgreementStoreManager
+from squid_py.did import did_to_id_bytes, id_to_did, did_to_id, DID
+from squid_py.keeper import Keeper, Token
 from squid_py.keeper.web3_provider import Web3Provider
 from squid_py.ocean.ocean import Ocean
-from squid_py.ocean.ocean_conditions import OceanConditions
-
-logging.getLogger().setLevel(logging.ERROR)
 
 
 def get_default_account(config):
@@ -30,30 +23,50 @@ def get_default_account(config):
 
 
 @click.pass_context
-def echo(ctx, response):
-    response = json.dumps(response, indent=2, sort_keys=True)
+def format_dict(ctx, response_dict):
+    response = json.dumps(response_dict, indent=2, sort_keys=True)
     if ctx.obj['json']:
         pass
     else:
         response = re.sub(r'\n\s*\n', '\n',
-            re.sub(r'[\",{}\[\]]', '', response))
-    click.echo(response)
+                          re.sub(r'[\",{}\[\]]', '', response))
+    return response
+
+
+def echo(response):
+    if isinstance(response, list):
+        response = {
+            'items': response,
+            'total': len(response)
+        }
+    click.echo(format_dict(response))
 
 
 @click.group()
 @click.option('--config-file', '-c',
               type=click.Path(),
               default='./config.ini', show_default=True)
-@click.option('--as-json', '-j',
-              is_flag=True)
+@click.option('--as-json', '-j', is_flag=True)
+@click.option('--verbose', '-v', is_flag=True)
 @click.pass_context
-def ocean(ctx, config_file, as_json):
+def ocean(ctx, config_file, as_json, verbose):
     """
     Simple CLI for registering and consuming assets in Ocean Protocol
+
+    \b
+                                               O           ,
+                                                       .</       ,
+  ____                      _______   ____          ,aT&/t    ,</
+ / __ \_______ ___ ____    / ___/ /  /  _/     o   o:\:::::95/b/
+/ /_/ / __/ -_) _ `/ _ \  / /__/ /___/ /        ' >::7:::::U2/)(
+\____/\__/\__/\_,_/_//_/  \___/____/___/           '*qf/P    '</
+                                                     '<)       '
     """
+    if not verbose:
+        logging.getLogger().setLevel(logging.ERROR)
+
     ocean = Ocean(Config(filename=config_file))
     account = get_default_account(ConfigProvider.get_config())
-
     ctx.obj = {
         'account': account,
         'ocean': ocean,
@@ -135,6 +148,7 @@ def token_transfer(ctx, amount, to):
     ocean, account = ctx.obj['ocean'], ctx.obj['account']
     ocean.tokens.transfer(to, int(amount), account)
     echo({
+        'amount': amount,
         'from': {
             'address': account.address,
             'balance': Token.get_instance().get_token_balance(account.address),
@@ -156,111 +170,194 @@ def assets():
 
 @assets.command('create')
 @click.argument('metadata', type=click.Path())
+@click.option('--secret-store', '-ss', is_flag=True)
+@click.option('--price', '-p', default=0)
+@click.option('--service-endpoint', '-s', default='http://localhost:8000')
+@click.option('--timeout', '-t', default=3600)
 @click.pass_context
-def assets_create(ctx, metadata):
-    ocean, account = ctx.obj['ocean'], ctx.obj['account']
-    if not isinstance(metadata, dict):
-        # Assume it is a path to metadata json file
-        metadata = json.load(open(metadata, 'r'))
+def assets_create(ctx, metadata, secret_store, price, service_endpoint, timeout):
+    """
+    Publish an asset from metadata
+    """
+    from .api.assets import create
+    response = create(ctx.obj['ocean'], ctx.obj['account'],
+                      metadata,
+                      secret_store,
+                      price=price,
+                      service_endpoint=service_endpoint,
+                      timeout=timeout)
+    echo(response)
 
-    ddo = ocean.assets.create(
-        metadata,
-        account,
-        providers=[account.address],
-        use_secret_store=False
-    )
-    did_registry = Keeper.get_instance().did_registry
-    provider = did_registry.to_checksum_address(account.address)
-    did_registry.add_provider(ddo.asset_id, provider, account)
-    echo({
-        'did': ddo.did,
-    })
+
+@assets.command('push')
+@click.argument('metadata', type=click.Path())
+@click.option('--secret-store', '-ss', is_flag=True)
+@click.option('--price', '-p', default=0)
+@click.option('--service-endpoint', '-s', default='http://localhost:8000')
+@click.option('--timeout', '-t', default=3600)
+@click.pass_context
+def assets_push(ctx, metadata, secret_store, price, service_endpoint, timeout):
+    """
+    Publish an asset from metadata
+    """
+    from ocean_cli.api.assets import create
+    import os
+    files = [f for f in os.listdir('.') if os.path.isfile(f)]
+
+    response = []
+    metadata = json.load(open(metadata, 'r'))
+
+    for f in files:
+        metadata['base']['files'][0]['url'] = f
+        response += [create(ctx.obj['ocean'], ctx.obj['account'],
+                            metadata,
+                            secret_store,
+                            price=price,
+                            service_endpoint=service_endpoint,
+                            timeout=timeout)]
+    echo(response)
+
+
+@assets.command('add-providers')
+@click.argument('did')
+@click.argument('provider', default=None)
+@click.pass_context
+def assets_add_providers(ctx, did, provider):
+    from .api.assets import add_providers
+    response = add_providers(ctx.obj['account'],
+                             did,
+                             provider)
+    echo(f"{response}")
+
+
+@assets.command('get-providers')
+@click.argument('did')
+def assets_get_providers(did):
+    response = Keeper.get_instance().did_registry\
+        .get_did_providers(did_to_id(did))
+    echo(response)
+
+
+@assets.command('get-owner')
+@click.argument('did')
+def assets_get_owner(did):
+    response = Keeper.get_instance().did_registry\
+        .get_did_owner(did_to_id(did))
+    echo(response)
+
+
+@assets.command('get')
+@click.argument('did')
+def assets_get(did):
+    from .api.assets import get
+    response = get(did)
+    echo(response)
 
 
 @assets.command('search')
 @click.argument('text')
+@click.option('--pretty', '-p', is_flag=True)
 @click.pass_context
-def assets_search(ctx, text):
-    ocean, account = ctx.obj['ocean'], ctx.obj['account']
-    result = ocean.assets.search(text, sort=None, offset=100, page=1)
-    echo([ddo.did for ddo in result])
-
-
-def _assets_order(ctx, did):
-    ocean, account = ctx.obj['ocean'], ctx.obj['account']
-    ddo = ocean.assets.resolve(did)
-    service = ddo.get_service(service_type=ServiceTypes.ASSET_ACCESS)
-    sa = ServiceAgreement.from_service_dict(service.as_dictionary())
-
-    service_agreement_id = ocean.assets.order(did, sa.service_definition_id,
-                                              account, True)
-
-    i = 0
-    while ocean.agreements.is_access_granted(
-            service_agreement_id, ddo.did,
-            account.address) is not True and i < 30:
-        time.sleep(1)
-        i += 1
-    return {
-        'service': sa.service_definition_id,
-        'agreement': service_agreement_id
-    }
+def assets_search(ctx, text, pretty):
+    """
+    Search assets by keyword
+    """
+    from .api.assets import search
+    response = search(ctx.obj['ocean'], text, pretty)
+    echo(response)
 
 
 @assets.command('order')
 @click.argument('did')
 @click.pass_context
 def assets_order(ctx, did):
-    echo(_assets_order(ctx, did))
-
-
-def _assets_consume(ctx, agreement_id, service_id):
-    ocean, account = ctx.obj['ocean'], ctx.obj['account']
-    agreement = ocean.agreements.get(agreement_id)
-    path = ocean.assets.consume(agreement_id,
-                                id_to_did(agreement.did), service_id, account,
-                                ConfigProvider.get_config().downloads_path)
-    files = os.listdir(path)
-
-    return {
-        'path': path.split('tuna/')[-1] + '/',
-        'files': files
-    }
+    """
+    Order asset: create Service Agreement and lock reward
+    """
+    from .api.assets import order
+    response = order(ctx.obj['ocean'], ctx.obj['account'], did)
+    echo([response])
 
 
 @assets.command('consume')
 @click.argument('did')
+@click.option('--method', '-m', default='download', show_default=True)
+@click.option('--wait', '-w', default=30, show_default=True)
 @click.pass_context
-def assets_consume(ctx, did):
-    response = _assets_order(ctx, did)
-    echo(_assets_consume(ctx, response['agreement'], response['service']))
+def assets_consume(ctx, did, method, wait):
+    """
+    Consume asset: create Service Agreement, lock reward, [wait], decrypt & download
+    """
+    from ocean_cli.api.assets import order_consume
+    response = order_consume(ctx.obj['ocean'], ctx.obj['account'], did, method, wait)
+    echo(response)
+
+
+@assets.command('pull')
+@click.argument('text')
+@click.option('--method', '-m', default='download', show_default=True)
+@click.option('--wait', '-w', default=30, show_default=True)
+@click.pass_context
+def assets_pull(ctx, text, method, wait):
+    """
+    Pull assets: consume search
+    """
+    from ocean_cli.api.assets import order_consume, search
+    response = []
+    for did in search(ctx.obj['ocean'], text):
+        print('pulling:', did)
+        response += [
+            order_consume(ctx.obj['ocean'], ctx.obj['account'], did, method, wait)
+        ]
+    echo(response)
+
+
+@assets.command('decrypt')
+@click.argument('did')
+@click.pass_context
+def assets_decrypt(ctx, did):
+    """
+    Decrypt asset service
+    """
+    from .api.assets import decrypt
+    response = decrypt(ctx.obj['ocean'], ctx.obj['account'], did)
+    echo(response)
 
 
 @assets.command('consume-agreement')
 @click.argument('agreement_id')
-@click.argument('service_id', default=1)
 @click.pass_context
-def assets_consume_agreement(ctx, agreement_id, service_id):
-    echo(_assets_consume(ctx, agreement_id, service_id))
+def assets_consume_agreement(ctx, agreement_id):
+    """
+    Consume agreement: decrypt and download
+    """
+    from .api.assets import consume
+    response = consume(ctx.obj['ocean'], ctx.obj['account'], agreement_id)
+    echo(response)
 
 
 @assets.command('resolve')
 @click.argument('did')
 @click.pass_context
 def assets_resolve(ctx, did):
+    """
+    Resolve DID to DID Document
+    """
     ocean, account = ctx.obj['ocean'], ctx.obj['account']
     asset = ocean.assets.resolve(did)
     echo(asset.as_dictionary())
 
 
 @assets.command('list')
-def assets_list():
-    did_registry = DIDRegistry.get_instance()
-    did_registry_ids = did_registry.contract_concise.getDIDRegisterIds()
-    echo([
-        id_to_did(Web3Provider.get_web3().toHex(did)[2:])
-        for did in did_registry_ids
-    ])
+@click.option('-a', '--address')
+@click.pass_context
+def assets_list(ctx, address):
+    """
+    List assets on-chain
+    """
+    from .api.assets import list_assets
+    response = list_assets(ctx.obj['ocean'], ctx.obj['account'], address)
+    echo(response)
 
 
 @ocean.group()
@@ -272,14 +369,13 @@ def agreements():
 
 
 @agreements.command('list')
-@click.argument('did')
-def agreements_list(did):
-    agreement_store = AgreementStoreManager.get_instance()
-    agreement_ids = agreement_store.contract_concise\
-        .getAgreementIdsForDID(did_to_id_bytes(did))
-    echo([
-        Web3Provider.get_web3().toHex(_id) for _id in agreement_ids
-    ])
+@click.argument('did_or_address')
+@click.pass_context
+def agreements_list(ctx, did_or_address):
+    from .api.agreements import list_agreements
+    response = list_agreements(ctx.obj['ocean'], ctx.obj['account'],
+                               did_or_address)
+    echo(response)
 
 
 @agreements.command('get')
@@ -336,17 +432,9 @@ def agreements_create_prepared(ctx, agreement_id, service_id, signature):
 @click.argument('service_id', default=1)
 @click.pass_context
 def agreements_create(ctx, did, service_id):
-    ocean, account = ctx.obj['ocean'], ctx.obj['account']
-    agreement_id, signature = ocean.agreements.prepare(
-        did, service_id, account
-    )
-    result = ocean.agreements.create(did, service_id, agreement_id,
-                                     signature, account.address, account)
-    echo({
-        'agreement': agreement_id,
-        'signature': signature,
-        'result': result
-    })
+    from .api.agreements import create
+    response = create(ctx.obj['ocean'], ctx.obj['account'], did, service_id)
+    echo(response)
 
 
 @agreements.command('send')
@@ -377,14 +465,9 @@ def conditions():
 @click.argument('agreement_id')
 @click.argument('amount')
 @click.pass_context
-def conditions_lock_reward(ctx, agreement_id, amount):
-    ocean, account = ctx.obj['ocean'], ctx.obj['account']
-    keeper = Keeper.get_instance()
-    ocean_conditions = OceanConditions(keeper)
-    keeper.token.token_approve(keeper.lock_reward_condition.address,
-                               int(amount),
-                               account)
-    response = ocean_conditions.lock_reward(agreement_id, int(amount), account)
+def conditions_lock_reward(ctx, agreement_id):
+    from .api.conditions import lock_reward
+    response = lock_reward(ctx.obj['ocean'], ctx.obj['account'], agreement_id)
     echo({
         "response": response
     })
@@ -395,12 +478,9 @@ def conditions_lock_reward(ctx, agreement_id, amount):
 @click.argument('consumer')
 @click.pass_context
 def conditions_access(ctx, agreement_id, consumer):
-    ocean, account = ctx.obj['ocean'], ctx.obj['account']
-    ocean_conditions = OceanConditions(Keeper.get_instance())
-    agreement = ocean.agreements.get(agreement_id)
-    response = ocean_conditions.grant_access(agreement_id,
-                                             id_to_did(agreement.did),
-                                             consumer, account)
+    from .api.conditions import access
+    response = access(ctx.obj['ocean'], ctx.obj['account'],
+                      agreement_id, consumer)
     echo({
         "response": response
     })
@@ -408,17 +488,117 @@ def conditions_access(ctx, agreement_id, consumer):
 
 @conditions.command('release-reward')
 @click.argument('agreement_id')
-@click.argument('amount')
 @click.pass_context
-def conditions_release_reward(ctx, agreement_id, amount):
-    ocean, account = ctx.obj['ocean'], ctx.obj['account']
-    ocean_conditions = OceanConditions(Keeper.get_instance())
-    response = ocean_conditions.release_reward(agreement_id, int(amount),
-                                               account)
+def conditions_release_reward(ctx, agreement_id):
+    from .api.conditions import release_reward
+    response = release_reward(ctx.obj['ocean'], ctx.obj['account'],
+                              agreement_id)
     echo({
         "response": response
     })
 
 
+@conditions.command('check-permissions')
+@click.argument('did')
+@click.pass_context
+def conditions_check_permissions(ctx, did):
+    ocean, account = ctx.obj['ocean'], ctx.obj['account']
+    access_ = ocean.keeper.access_secret_store_condition.get_instance()
+    response = access_.check_permissions(did_to_id_bytes(did), account.address)
+    echo({
+        "response": response
+    })
+
+
+@ocean.group()
+def events():
+    """
+    Listen to events
+    """
+    pass
+
+
+def print_event(event, *_):
+    print(f"\n{'*'*20}"
+          f"\n{event['blockNumber']}: {event['event']}"
+          f"\n{event}"
+          f"\n{'*'*20}")
+
+
+@events.command('listen')
+@click.pass_context
+def listen(ctx):
+    ocean, account = ctx.obj['ocean'], ctx.obj['account']
+    did = ocean.keeper.did_registry.get_instance()
+    template = ocean.keeper.escrow_access_secretstore_template.get_instance()
+    lockreward = ocean.keeper.lock_reward_condition.get_instance()
+    conditions = ocean.keeper.condition_manager.get_instance()
+    filters = [
+        did.events.DIDAttributeRegistered.createFilter(fromBlock='latest'),
+        template.events.AgreementCreated.createFilter(fromBlock='latest'),
+        lockreward.events.Fulfilled.createFilter(fromBlock='latest'),
+        conditions.events.ConditionUpdated.createFilter(fromBlock='latest')
+    ]
+    while True:
+        for filter in filters:
+            for event in filter.get_new_entries():
+                print_event(event)
+            time.sleep(0.5)
+
+
+@events.command('access')
+@click.pass_context
+def access(ctx):
+    ocean, account = ctx.obj['ocean'], ctx.obj['account']
+    template = ocean.keeper.escrow_access_secretstore_template.get_instance()
+    filter = template.events.AgreementCreated.createFilter(fromBlock='latest')
+    while True:
+        for event in filter.get_new_entries():
+            access_provider = event['args']['_accessProvider']
+            if access_provider == account.address:
+                agreement_id = Web3Provider.get_web3().toHex(
+                    event['args']['_agreementId'])
+                access_consumer = event['args']['_accessConsumer']
+                from .api.conditions import access_release
+                access_release(ocean, account, agreement_id, access_consumer)
+        time.sleep(0.5)
+
+
+@ocean.group()
+def secretstore():
+    """
+    Encrypt and decrypt with Parity SecretStore
+    """
+    pass
+
+
+@secretstore.command('encrypt')
+@click.argument('plain_text')
+@click.pass_context
+def encrypt(ctx, plain_text):
+    ocean, account = ctx.obj['ocean'], ctx.obj['account']
+    doc_id = did_to_id(DID.did())
+    encrypted_document = ocean.secret_store.encrypt(doc_id, plain_text, account)
+    echo({
+        'docId': doc_id,
+        'encryptedDocument': encrypted_document
+    })
+
+
+@secretstore.command('decrypt')
+@click.argument('doc_id')
+@click.argument('cipher_text')
+@click.pass_context
+def decrypt(ctx, doc_id, cipher_text):
+    ocean, account = ctx.obj['ocean'], ctx.obj['account']
+    decrypted_document = ocean.secret_store.decrypt(doc_id, cipher_text, account)
+
+    echo({
+        'decryptedDocument': decrypted_document
+    })
+
+
 if __name__ == "__main__":
     ocean()
+
+
